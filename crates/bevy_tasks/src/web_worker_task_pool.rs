@@ -10,16 +10,22 @@ pub const STACK_ALIGN: usize = 1024 * 64;
 static mut TLS_SIZE: usize = 0;
 
 #[wasm_bindgen]
-pub fn run_as_worker(work_ptr: u32) -> Result<(), JsValue> {
-    let ptr = unsafe { Box::from_raw(work_ptr as *mut Work) };
-    (ptr.func)();
-
-    // TODO: Return JsValue from ptr.func
-    Ok(())
+pub unsafe fn run_as_worker(worker_ptr: u32) -> Result<(), JsValue> {
+    let mut worker = ptr as *mut Worker;
+    loop {
+        if (*worker).work != 0 {
+            let work = Box::from_raw((*worker).work as *mut Work);
+            (work.func)(work.scope);
+            (*worker).work = 0;
+        }
+        (*worker).available = 1;
+        atomics::memory_atomic_wait32(&mut (*worker).available as *mut i32, 1, -1);
+    }
 }
 
-struct Work {
-    func: Box<dyn FnOnce() + Send>,
+struct Work<'scope, T> {
+    func: Box<dyn FnOnce(&mut Scope<'scope, T>) + 'scope + Send>,
+    scope: Box<dyn Scope<'scope, T>>,
 }
 
 /// Used to create a TaskPool
@@ -72,11 +78,45 @@ impl TaskPoolBuilder {
 }
 
 #[derive(Debug)]
-struct TaskPoolInner {
-    workers: Vec<Worker>,
+struct WorkerPool {
+    workers: Mutex<Vec<Worker>>,
 }
 
-impl Drop for TaskPoolInner {
+impl WorkerPool {
+    fn available_worker(&self) -> Result<usize, String> {
+        let workers = self.workers.lock();
+        for (idx, worker) in workers.iter().enumerate() {
+            if worker.available == 1 {
+                return Ok(idx);
+            }
+        }
+
+        // TODO: Spawn new worker if one is not available
+    }
+
+    fn execute<'scope, F, T>(&self, f: F, scope: &mut S)
+    where
+        S: Scope<'scope, T>,
+        F: FnOnce(&mut S) + 'scope + Send
+    {
+        let worker = self.available_worker()?;
+        let mut workers = self.workers.lock();
+        assert_eq!(workers[worker].available, 1);
+        let work = Box::new(Work {
+            func: Box::new(f),
+            scope: Box::new(scope)
+        });
+        let work_ptr = Box::into_raw(work);
+        workers[worker].available = 0;
+        workers[worker].work = work_ptr as u32;
+        unsafe {
+            atomics::memory_atomic_notify(workers[worker].available as *mut i32, 1);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WorkerPool {
     fn drop(&mut self) {
         for worker in self.workers.drain(..) {
             worker.terminate();
@@ -84,19 +124,19 @@ impl Drop for TaskPoolInner {
     }
 }
 
-/// A thread pool for executing tasks. Tasks are futures that are being automatically driven by
+/// A pool for executing tasks. Tasks are futures that are being automatically driven by
 /// the pool on web workers owned by the pool.
 #[derive(Debug, Default, Clone)]
 pub struct TaskPool {
     /// The executor for the pool
     ///
-    /// This has to be separate from TaskPoolInner because we have to create an Arc<Executor> to
+    /// This has to be separate from WorkerPool because we have to create an Arc<Executor> to
     /// pass into the worker threads, and we must create the worker threads before we can create
-    /// the Vec<Task<T>> contained within TaskPoolInner
+    /// the Vec<Task<T>> contained within WorkerPool
     executor: Arc<async_executor::Executor<'static>>,
 
     /// Inner state of the pool
-    inner: Arc<TaskPoolInner>,
+    worker_pool: Arc<WorkerPool>,
 }
 
 impl TaskPool {
@@ -137,7 +177,7 @@ impl TaskPool {
 
         Self {
             executor,
-            inner: Arc::new(TaskPoolInner {
+            worker_pool: Arc::new(WorkerPool {
                 workers,
             }),
         }
@@ -145,7 +185,7 @@ impl TaskPool {
 
     /// Return the number of threads owned by the task pool
     pub fn thread_num(&self) -> usize {
-        self.inner.workers.len()
+        self.worker_pool.workers.len()
     }
 
     /// Allows spawning non-`static futures on the thread pool. The function takes a callback,
@@ -158,8 +198,11 @@ impl TaskPool {
         F: FnOnce(&mut Scope<'scope, T>) + 'scope + Send,
         T: Send + 'static,
     {
-        let work = Box::new(Work { func: Box::new(f) });
-        let ptr = Box::into_raw(work);
+
+        // TODO: May need to wrap the execution in a future which can be driven by the executor, in order to
+        // obtain the result value of the execution
+        // TODO: self.worker_pool.execute(f, &mut scope);
+
         // let executor: &async_executor::Executor = &*self.executor;
         // let executor: &'scope async_executor::Executor = unsafe { mem::transmute(executor) };
         // let local_executor: &'scope async_executor::LocalExecutor =
@@ -307,7 +350,9 @@ impl WorkerMemory {
 pub struct Worker {
     name: String,
     memory: WorkerMemory,
-    worker: web_sys::Worker
+    worker: web_sys::Worker,
+    work: u32,
+    available: i32
 }
 
 impl Worker {
@@ -315,7 +360,7 @@ impl Worker {
     let wasm
     let initialized = false
 
-    self.onmessage = async function({ binary, memory, stack, tls, work }) {
+    self.onmessage = async function({ binary, memory, stack, tls, worker }) {
         if (!initialized) {
             wasm = await WebAssembly.instantiate(binary, {
                 env: {
@@ -324,15 +369,13 @@ impl Worker {
                 }
             })
     
-            wasm.exports.set_stack_pointer(allocations.stack)
-            wasm.exports.__wasm_init_tls(allocations.tls)
+            wasm.exports.set_stack_pointer(stack)
+            wasm.exports.__wasm_init_tls(tls)
             
             initialized = true
         }
 
-        if (work) {
-            self.postMessage(wasm.exports.run_as_worker(work))
-        }
+        wasm.exports.run_as_worker(worker)
     }
     ";
 
@@ -362,15 +405,9 @@ impl Worker {
         js_sys::Reflect::set(&init_message, &"memory".into(), wasm_bindgen::memory());
         js_sys::Reflect::set(&init_message, &"stack".into(), self.memory.stack);
         js_sys::Reflect::set(&init_message, &"tls".into(), self.memory.tls);
+        js_sys::Reflect::set(&init_message, &"worker".into(), worker as *const Worker as u32);
 
         worker.post_message(&init_message);
-    }
-
-    pub fn work(mut self) {
-        let work_message = js_sys::Object::new();
-        js_sys::Reflect::set(&work_message, &"work".into(), self.memory.stack);
-
-        worker.post_message(&work_message);
     }
 }
 
