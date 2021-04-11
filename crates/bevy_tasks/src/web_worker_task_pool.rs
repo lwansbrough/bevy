@@ -9,6 +9,19 @@ use wasm_set_stack_pointer;
 pub const STACK_ALIGN: usize = 1024 * 64;
 static mut TLS_SIZE: usize = 0;
 
+#[wasm_bindgen]
+pub fn run_as_worker(work_ptr: u32) -> Result<(), JsValue> {
+    let ptr = unsafe { Box::from_raw(work_ptr as *mut Work) };
+    (ptr.func)();
+
+    // TODO: Return JsValue from ptr.func
+    Ok(())
+}
+
+struct Work {
+    func: Box<dyn FnOnce() + Send>,
+}
+
 /// Used to create a TaskPool
 #[derive(Debug, Default, Clone)]
 pub struct TaskPoolBuilder {
@@ -145,78 +158,60 @@ impl TaskPool {
         F: FnOnce(&mut Scope<'scope, T>) + 'scope + Send,
         T: Send + 'static,
     {
-        let executor: &async_executor::Executor = &*self.executor;
-        let executor: &'scope async_executor::Executor = unsafe { mem::transmute(executor) };
-        let local_executor: &'scope async_executor::LocalExecutor =
-            unsafe { mem::transmute(local_executor) };
-        let mut scope = Scope {
-            executor,
-            local_executor,
-            spawned: Vec::new(),
-        };
-
-        f(&mut scope);
-
-        if scope.spawned.is_empty() {
-            Vec::default()
-        } else if scope.spawned.len() == 1 {
-            vec![future::block_on(&mut scope.spawned[0])]
-        } else {
-            let fut = async move {
-                let mut results = Vec::with_capacity(scope.spawned.len());
-                for task in scope.spawned {
-                    results.push(task.await);
-                }
-
-                results
-            };
-
-            // Pin the futures on the stack.
-            pin!(fut);
-
-            // SAFETY: This function blocks until all futures complete, so we do not read/write
-            // the data from futures outside of the 'scope lifetime. However,
-            // rust has no way of knowing this so we must convert to 'static
-            // here to appease the compiler as it is unable to validate safety.
-            let fut: Pin<&mut (dyn Future<Output = Vec<T>>)> = fut;
-            let fut: Pin<&'static mut (dyn Future<Output = Vec<T>> + 'static)> =
-                unsafe { mem::transmute(fut) };
-
-            // The thread that calls scope() will participate in driving tasks in the pool
-            // forward until the tasks that are spawned by this scope() call
-            // complete. (If the caller of scope() happens to be a thread in
-            // this thread pool, and we only have one thread in the pool, then
-            // simply calling future::block_on(spawned) would deadlock.)
-            let mut spawned = local_executor.spawn(fut);
-            loop {
-                if let Some(result) = future::block_on(future::poll_once(&mut spawned)) {
-                    break result;
-                };
-
-                self.executor.try_tick();
-                local_executor.try_tick();
-            }
-        }
-
-        // let executor = &async_executor::LocalExecutor::new();
-        // let executor: &'scope async_executor::LocalExecutor<'scope> =
-        //     unsafe { mem::transmute(executor) };
-
+        let work = Box::new(Work { func: Box::new(f) });
+        let ptr = Box::into_raw(work);
+        // let executor: &async_executor::Executor = &*self.executor;
+        // let executor: &'scope async_executor::Executor = unsafe { mem::transmute(executor) };
+        // let local_executor: &'scope async_executor::LocalExecutor =
+        //     unsafe { mem::transmute(local_executor) };
         // let mut scope = Scope {
         //     executor,
-        //     results: Vec::new(),
+        //     local_executor,
+        //     spawned: Vec::new(),
         // };
 
         // f(&mut scope);
 
-        // // Loop until all tasks are done
-        // while executor.try_tick() {}
+        // if scope.spawned.is_empty() {
+        //     Vec::default()
+        // } else if scope.spawned.len() == 1 {
+        //     vec![future::block_on(&mut scope.spawned[0])]
+        // } else {
+        //     let fut = async move {
+        //         let mut results = Vec::with_capacity(scope.spawned.len());
+        //         for task in scope.spawned {
+        //             results.push(task.await);
+        //         }
 
-        // scope
-        //     .results
-        //     .iter()
-        //     .map(|result| result.lock().unwrap().take().unwrap())
-        //     .collect()
+        //         results
+        //     };
+
+        //     // Pin the futures on the stack.
+        //     pin!(fut);
+
+        //     // SAFETY: This function blocks until all futures complete, so we do not read/write
+        //     // the data from futures outside of the 'scope lifetime. However,
+        //     // rust has no way of knowing this so we must convert to 'static
+        //     // here to appease the compiler as it is unable to validate safety.
+        //     let fut: Pin<&mut (dyn Future<Output = Vec<T>>)> = fut;
+        //     let fut: Pin<&'static mut (dyn Future<Output = Vec<T>> + 'static)> =
+        //         unsafe { mem::transmute(fut) };
+
+        //     // The thread that calls scope() will participate in driving tasks in the pool
+        //     // forward until the tasks that are spawned by this scope() call
+        //     // complete. (If the caller of scope() happens to be a thread in
+        //     // this thread pool, and we only have one thread in the pool, then
+        //     // simply calling future::block_on(spawned) would deadlock.)
+        //     let mut spawned = local_executor.spawn(fut);
+        //     loop {
+        //         if let Some(result) = future::block_on(future::poll_once(&mut spawned)) {
+        //             break result;
+        //         };
+
+        //         self.executor.try_tick();
+        //         local_executor.try_tick();
+        //     }
+        // }
     }
 
     // Spawns a static future onto the JS event loop. For now it is returning FakeTask
@@ -234,10 +229,6 @@ impl TaskPool {
         T: 'static,
     {
         Task::new(self.executor.spawn(future))
-        // wasm_bindgen_futures::spawn_local(async move {
-        //     future.await;
-        // });
-        // FakeTask
     }
 
     pub fn spawn_local<T>(&self, future: impl Future<Output = T> + 'static) -> Task<T>
@@ -245,7 +236,6 @@ impl TaskPool {
         T: 'static,
     {
         Task::new(TaskPool::LOCAL_EXECUTOR.with(|executor| executor.spawn(future)))
-        // self.spawn(future)
     }
 }
 
@@ -341,7 +331,7 @@ impl Worker {
         }
 
         if (work) {
-            wasm.exports.run_as_worker(work)
+            self.postMessage(wasm.exports.run_as_worker(work))
         }
     }
     ";
@@ -374,6 +364,13 @@ impl Worker {
         js_sys::Reflect::set(&init_message, &"tls".into(), self.memory.tls);
 
         worker.post_message(&init_message);
+    }
+
+    pub fn work(mut self) {
+        let work_message = js_sys::Object::new();
+        js_sys::Reflect::set(&work_message, &"work".into(), self.memory.stack);
+
+        worker.post_message(&work_message);
     }
 }
 
