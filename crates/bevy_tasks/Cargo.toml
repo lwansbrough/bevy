@@ -15,6 +15,8 @@ keywords = ["bevy"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+
+
 [dependencies]
 futures-lite = "1.4.0"
 event-listener = "2.4.0"
@@ -24,3 +26,10 @@ instant = { version = "0.1", features = ["wasm-bindgen"] }
 num_cpus = "1"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+wasm-bindgen = { version = "0.2" }
+js-sys = { version = "0.3" }
+web-sys = { version = "0.3", features = ["Blob", "Navigator", "Url", "Window", "Worker"] }
+wasm_set_stack_pointer = { git = "https://github.com/kettle11/wasm_set_stack_pointer" }
+
+[target.'cfg(target_arch = "wasm32")'.build]
+rustflags = '-Ctarget-feature=+atomics,+bulk-memory'
