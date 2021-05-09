@@ -23,9 +23,8 @@ pub unsafe fn run_as_worker(worker_ptr: u32) -> Result<(), JsValue> {
     }
 }
 
-struct Work<'scope, T> {
-    func: Box<dyn FnOnce(&mut Scope<'scope, T>) + 'scope + Send>,
-    scope: Box<dyn Scope<'scope, T>>,
+struct Work {
+    func: Box<dyn FnOnce() + Send>,
 }
 
 /// Used to create a TaskPool
@@ -104,7 +103,6 @@ impl WorkerPool {
         assert_eq!(workers[worker].available, 1);
         let work = Box::new(Work {
             func: Box::new(f),
-            scope: Box::new(scope)
         });
         let work_ptr = Box::into_raw(work);
         workers[worker].available = 0;
